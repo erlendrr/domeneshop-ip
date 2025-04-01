@@ -15,7 +15,7 @@ limitations under the License.
 */
 
 use clap::Parser;
-use dialoguer::{Confirm, Input, Password,  theme::ColorfulTheme};
+use dialoguer::{Confirm, Input, Password, theme::ColorfulTheme};
 use dotenvy;
 use reqwest::blocking::Client;
 use serde::Deserialize;
@@ -101,6 +101,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let client = Client::new();
 
     let domains_url = "https://api.domeneshop.no/v0/domains";
+
+    println!("Authenticating to Domeneshop API by fetching domains...");
+
     let auth_test = client
         .get(domains_url)
         .basic_auth(&token, Some(&secret))
@@ -113,7 +116,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         );
         return Ok(());
     }
-    
+
     println!("Authentication successful.");
 
     if !use_saved_config {
@@ -150,49 +153,43 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     for domain in &domain_names {
         println!("  - {}", domain);
     }
-    
+
     // Ask the user to input a domain or subdomain
-    let domain_input: String = Input::with_theme(&theme)
+    let mut top_level_domain_id = None;
+    let _domain_input: String = Input::with_theme(&theme)
         .with_prompt("Enter a domain or subdomain (e.g. example.com or sub.example.com)")
         .validate_with(|input: &String| -> Result<(), &str> {
-            if domain_names.contains(input) {
+            // Check for direct domain match
+            if let Some(domain) = domains.iter().find(|d| d.domain == *input) {
+                top_level_domain_id = Some(domain.id);
                 return Ok(());
             }
-            
-            let is_valid_subdomain = domain_names.iter().any(|owned_domain| {
-                input.ends_with(&format!(".{}", owned_domain))
-            });
-            
-            if is_valid_subdomain {
-                Ok(())
-            } else {
-                Err("You don't own this domain. Please enter a domain you own or a subdomain of it.")
+
+            // Check for subdomain match
+            for domain in &domains {
+                if input.ends_with(&format!(".{}", domain.domain)) {
+                    top_level_domain_id = Some(domain.id);
+                    return Ok(());
+                }
             }
+
+            Err("You don't own this domain. Please enter a domain you own or a subdomain of it.")
         })
         .interact_text()?;
-    
-    // Find the base domain for the input
-    let selected_domain = if domain_names.contains(&domain_input) {
-        // Direct match with an owned domain
-        domains.iter().find(|d| d.domain == domain_input).unwrap()
-    } else {
-        // It's a subdomain, find the parent domain
-        let parent_domain = domain_names.iter()
-            .find(|owned_domain| domain_input.ends_with(&format!(".{}", owned_domain)))
-            .unwrap();
-        domains.iter().find(|d| &d.domain == parent_domain).unwrap()
-    };
 
-    println!(
-        "Selected domain: {} (ID: {})",
-        domain_input, selected_domain.id
-    );
+    let top_level_domain = domains
+        .iter()
+        .find(|d| d.id == top_level_domain_id.expect("Domain ID not found"))
+        .expect("Domain not found");
+
+    println!("Getting DNS records for {}...", top_level_domain.domain);
 
     // Fetch DNS records for the selected domain.
     let dns_url = format!(
         "https://api.domeneshop.no/v0/domains/{}/dns",
-        selected_domain.id
+        top_level_domain.id
     );
+
     let dns_response = client
         .get(&dns_url)
         .basic_auth(&token, Some(&secret))
@@ -210,13 +207,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     if dns_records.is_empty() {
         println!("No DNS records found for the domain.");
     } else {
-        println!("\nDNS Records for {}:", selected_domain.domain);
+        println!("\nDNS Records for {}:", top_level_domain.domain);
         for rec in dns_records {
             // If host is "@", it represents the root domain.
             let full_host = if rec.host == "@" {
-                selected_domain.domain.clone()
+                top_level_domain.domain.clone()
             } else {
-                format!("{}.{}", rec.host, selected_domain.domain)
+                format!("{}.{}", rec.host, top_level_domain.domain)
             };
             println!(
                 "ID: {} | Host: {} | Type: {} | Data: {} | TTL: {}",
