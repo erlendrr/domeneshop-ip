@@ -17,6 +17,7 @@ limitations under the License.
 use clap::Parser;
 use dialoguer::{Confirm, Input, Password, theme::ColorfulTheme};
 use dotenvy;
+use pnet::datalink;
 use reqwest::blocking::Client;
 use serde::Deserialize;
 use std::fs;
@@ -36,6 +37,9 @@ struct Cli {
 
     #[arg(long, env = "DOMENESHOP_API_SECRET", hide_env_values = true)]
     secret: Option<String>,
+
+    #[arg(long)]
+    domain_input: Option<String>,
 }
 
 #[derive(Deserialize, Debug)]
@@ -68,6 +72,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let config_path = config_dir.join(".env");
 
     let mut use_saved_config = false;
+
     if config_path.exists() {
         use_saved_config = Confirm::with_theme(&theme)
             .with_prompt(format!(
@@ -156,7 +161,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Ask the user to input a domain or subdomain
     let mut top_level_domain_id = None;
-    let _domain_input: String = Input::with_theme(&theme)
+
+    let domain_input = match cli.domain_input {
+        Some(d) => d,
+        None => Input::with_theme(&theme)
         .with_prompt("Enter a domain or subdomain (e.g. example.com or sub.example.com)")
         .validate_with(|input: &String| -> Result<(), &str> {
             // Check for direct domain match
@@ -175,7 +183,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
             Err("You don't own this domain. Please enter a domain you own or a subdomain of it.")
         })
-        .interact_text()?;
+        .interact_text()?,
+    };
 
     let top_level_domain = domains
         .iter()
@@ -219,6 +228,29 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 "ID: {} | Host: {} | Type: {} | Data: {} | TTL: {}",
                 rec.id, full_host, rec.record_type, rec.data, rec.ttl
             );
+        }
+    }
+
+    let interfaces = datalink::interfaces();
+    let interfaces_with_ip = interfaces
+        .into_iter()
+        .filter(|iface| !iface.ips.is_empty())
+        .collect::<Vec<_>>();
+
+    println!("");
+    if interfaces_with_ip.is_empty() {
+        println!("No network interfaces with IP addresses found.");
+    } else {
+        println!("Network interfaces with IP addresses:");
+        for iface in &interfaces_with_ip {
+            println!(
+                "{} {}:",
+                iface.name,
+                iface.mac.expect("MAC address not found")
+            );
+            for ip in &iface.ips {
+                println!("  - IP Address: {}", ip);
+            }
         }
     }
 
