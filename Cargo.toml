@@ -1,14 +1,25 @@
 [package]
-name = "set-domeneshop-dns-ip-pointer"
+name = "domeneshop-ip"
 version = "0.1.0"
 edition = "2024"
+authors = ["Erlend Ryan"]
+description = "CLI tool to update DNS IP records for Domeneshop"
+license = "Apache-2.0"
+readme = "README.md"
+repository = "https://github.com/erlendrr/domeneshop-ip"
+keywords = ["dns", "cli", "domeneshop", "ip"]
+categories = ["command-line-utilities"]
+
+[[bin]]
+name = "domeneshop-ip"
+path = "src/main.rs"
 
 [dependencies]
-clap = { version = "4.5.34", features = ["derive", "env"] }
-dialoguer = "0.11.0"
-dirs = "6.0.0"
-dotenvy = { version = "0.15.7", features = ["clap"] }
-pnet = "0.35.0"
+clap = { version = "4.5.35", features = ["derive", "env"] }
+colored = "3.0.0"
+dialoguer = "0.11"
+dotenvy = "0.15"
+pnet = "0.35"
 reqwest = { version = "0.12.15", features = ["blocking", "json"] }
-serde = { version = "1.0.219", features = ["derive"] }
-colored = "2.0.0"
+serde = { version = "1.0", features = ["derive"] }
+dirs = "6.0.0"
