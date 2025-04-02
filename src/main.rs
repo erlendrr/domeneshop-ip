@@ -353,10 +353,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     // Prompt user for IP selection with public IP as default
-    let selected_ip = Input::<String>::with_theme(&theme)
-        .with_prompt("Enter the IP address to use")
-        .default(public_ip.clone())
-        .interact_text()?;
+    let selected_ip = if cli.yes {
+        public_ip.clone()
+    } else {
+        Input::<String>::with_theme(&theme)
+            .with_prompt("Enter the IP address to use")
+            .default(public_ip.clone())
+            .interact_text()?
+    };
 
     println!("Selected IP address: {}", selected_ip);
 
