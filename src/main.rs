@@ -38,8 +38,11 @@ struct Cli {
     #[arg(long, env = "DOMENESHOP_API_SECRET", hide_env_values = true)]
     secret: Option<String>,
 
-    #[arg(long)]
+    #[arg(long, help = "Domain to manage (e.g. example.com or sub.example.com")]
     domain_input: Option<String>,
+
+    #[arg(short = 'y', long = "yes", help = "Skip all confirmation prompts")]
+    yes: bool,
 }
 
 #[derive(Deserialize, Debug)]
@@ -58,7 +61,26 @@ struct DnsRecord {
     data: String,
 }
 
+fn validate_domain_input(input: &str, domains: &[Domain]) -> Result<(String, u64), &'static str> {
+    // Check for direct domain match
+    if let Some(domain) = domains.iter().find(|d| d.domain == input) {
+        return Ok((input.to_string(), domain.id));
+    }
+
+    // Check for subdomain match
+    for domain in domains {
+        if input.ends_with(&format!(".{}", domain.domain)) {
+            return Ok((input.to_string(), domain.id));
+        }
+    }
+
+    Err("You don't own this domain. Please enter a domain you own or a subdomain of it.")
+}
+
 fn main() -> Result<(), Box<dyn std::error::Error>> {
+    // Parse CLI arguments first - Clap will automatically handle --help
+    let cli = Cli::parse();
+
     let theme = ColorfulTheme::default();
 
     // Determine configuration directory:
@@ -71,31 +93,41 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     fs::create_dir_all(&config_dir)?;
     let config_path = config_dir.join(".env");
 
-    let mut use_saved_config = false;
-
-    if config_path.exists() {
-        use_saved_config = Confirm::with_theme(&theme)
-            .with_prompt(format!(
-                "Found configuration at {}. Use saved credentials?",
-                config_path.display()
-            ))
-            .default(true)
-            .interact()?;
-        if use_saved_config {
-            dotenvy::from_path(&config_path).ok();
+    // Only load the saved config if credentials are not provided via CLI
+    let mut use_saved_config: bool = false;
+    if (cli.token.is_none() || cli.secret.is_none()) && config_path.exists() {
+        if cli.yes {
+            use_saved_config = true;
+            println!("Using saved credentials from {}", config_path.display());
+        } else {
+            use_saved_config = Confirm::with_theme(&theme)
+                .with_prompt(format!(
+                    "Found configuration at {}. Use saved credentials?",
+                    config_path.display()
+                ))
+                .default(true)
+                .interact()?;
         }
     }
+    if use_saved_config {
+        dotenvy::from_path(&config_path).ok();
+    }
 
-    let cli = Cli::parse();
-
-    let token = match cli.token {
+    // Get token and secret from CLI args or prompt
+    let token = match cli
+        .token
+        .or_else(|| std::env::var("DOMENESHOP_API_TOKEN").ok())
+    {
         Some(t) => t,
         None => Input::with_theme(&theme)
             .with_prompt("Enter Domeneshop API Token")
             .interact_text()?,
     };
 
-    let secret = match cli.secret {
+    let secret = match cli
+        .secret
+        .or_else(|| std::env::var("DOMENESHOP_API_SECRET").ok())
+    {
         Some(s) => s,
         None => Password::with_theme(&theme)
             .with_prompt("Enter Domeneshop API Secret")
@@ -121,14 +153,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         );
         return Ok(());
     }
-
-    println!("Authentication successful.");
-
     if !use_saved_config {
-        let save_creds = Confirm::with_theme(&theme)
-            .with_prompt("Do you want to save your credentials for future use?")
-            .default(false)
-            .interact()?;
+        let save_creds = if cli.yes {
+            false
+        } else {
+            Confirm::with_theme(&theme)
+                .with_prompt("Do you want to save your credentials for future use?")
+                .default(false)
+                .interact()?
+        };
         if save_creds {
             let mut file = fs::File::create(&config_path)?;
             writeln!(file, "DOMENESHOP_API_TOKEN={}", token)?;
@@ -162,28 +195,29 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Ask the user to input a domain or subdomain
     let mut top_level_domain_id = None;
 
-    let domain_input = match cli.domain_input {
-        Some(d) => d,
-        None => Input::with_theme(&theme)
-        .with_prompt("Enter a domain or subdomain (e.g. example.com or sub.example.com)")
-        .validate_with(|input: &String| -> Result<(), &str> {
-            // Check for direct domain match
-            if let Some(domain) = domains.iter().find(|d| d.domain == *input) {
-                top_level_domain_id = Some(domain.id);
+    let domain_input = match &cli.domain_input {
+        Some(input) => match validate_domain_input(input, &domains) {
+            Ok((input_str, domain_id)) => {
+                top_level_domain_id = Some(domain_id);
+                input_str
+            }
+            Err(err) => {
+                println!("{}", err);
                 return Ok(());
             }
-
-            // Check for subdomain match
-            for domain in &domains {
-                if input.ends_with(&format!(".{}", domain.domain)) {
-                    top_level_domain_id = Some(domain.id);
-                    return Ok(());
+        },
+        None => Input::with_theme(&theme)
+            .with_prompt("Enter a domain or subdomain (e.g. example.com or sub.example.com)")
+            .validate_with(|input: &String| -> Result<(), &str> {
+                match validate_domain_input(input, &domains) {
+                    Ok((_, domain_id)) => {
+                        top_level_domain_id = Some(domain_id);
+                        Ok(())
+                    }
+                    Err(err) => Err(err),
                 }
-            }
-
-            Err("You don't own this domain. Please enter a domain you own or a subdomain of it.")
-        })
-        .interact_text()?,
+            })
+            .interact_text()?,
     };
 
     let top_level_domain = domains
