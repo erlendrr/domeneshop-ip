@@ -1,6 +1,6 @@
 # Domeneshop IP Updater
 
-A CLI tool by Erlend Ryan for updating DNS records at Domeneshop with your current IP address.
+A CLI tool for updating DNS records at Domeneshop with your current IP address.
 
 ## Installation
 
