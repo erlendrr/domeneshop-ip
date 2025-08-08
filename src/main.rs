@@ -166,28 +166,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         );
         return Ok(());
     }
-    if !use_saved_config {
-        let save_creds = if cli.yes {
-            false
-        } else {
-            Confirm::with_theme(&theme)
-                .with_prompt("Do you want to save your credentials for future use?")
-                .default(false)
-                .interact()?
-        };
-        if save_creds {
-            let mut file = fs::File::create(&config_path)?;
-            writeln!(file, "DOMENESHOP_API_TOKEN={}", token)?;
-            writeln!(file, "DOMENESHOP_API_SECRET={}", secret)?;
-            // On Unix, restrict permissions to owner-read/write only.
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::PermissionsExt;
-                fs::set_permissions(&config_path, fs::Permissions::from_mode(0o600))?;
-            }
-            println!("Credentials saved to {}", config_path.display());
-        }
-    }
 
     // Reuse the response from the auth test instead of making a second request
     let response = auth_test;
@@ -521,6 +499,30 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             if let Ok(error_text) = response.text() {
                 eprintln!("Error: {}", error_text);
             }
+        }
+    }
+
+    // Ask user if they want to save credentials at the end
+    if !use_saved_config {
+        let save_creds = if cli.yes {
+            false
+        } else {
+            Confirm::with_theme(&theme)
+                .with_prompt("Do you want to save your credentials for future use?")
+                .default(false)
+                .interact()?
+        };
+        if save_creds {
+            let mut file = fs::File::create(&config_path)?;
+            writeln!(file, "DOMENESHOP_API_TOKEN={}", token)?;
+            writeln!(file, "DOMENESHOP_API_SECRET={}", secret)?;
+            // On Unix, restrict permissions to owner-read/write only.
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                fs::set_permissions(&config_path, fs::Permissions::from_mode(0o600))?;
+            }
+            println!("Credentials saved to {}", config_path.display());
         }
     }
 
