@@ -1,6 +1,6 @@
 [package]
 name = "domeneshop-ip"
-version = "0.1.1"
+version = "0.1.2"
 edition = "2024"
 authors = ["Erlend Ryan"]
 description = "CLI tool to update DNS IP records for Domeneshop"

@@ -33,18 +33,28 @@ fi
 
 echo -e "Found domeneshop-ip at: ${GREEN}$BINARY_PATH${NC}"
 
-# Check if auto-update config exists
+# Locate auto-update configs (supports multiple)
 CONFIG_DIR="$HOME/.config/domeneshop"
-CONFIG_FILE="$CONFIG_DIR/auto_update_config.json"
+AUTO_DIR="$CONFIG_DIR/auto_update"
+LEGACY_FILE="$CONFIG_DIR/auto_update_config.json"
 
-if [ ! -f "$CONFIG_FILE" ]; then
-    echo -e "${YELLOW}Warning: Auto-update configuration not found at $CONFIG_FILE${NC}"
-    echo "You need to run domeneshop-ip in interactive mode first and enable auto-update."
-    echo ""
-    echo "Run: $BINARY_PATH"
-    echo "Then follow the prompts to set up auto-update."
-    echo ""
-    read -p "Do you want to continue with cron setup anyway? (y/N): " -n 1 -r
+declare -a CONFIG_FILES=()
+
+if [ -d "$AUTO_DIR" ]; then
+    while IFS= read -r -d '' file; do
+        CONFIG_FILES+=("$file")
+    done < <(find "$AUTO_DIR" -type f -name "*.json" -print0 2>/dev/null)
+fi
+
+# Fallback to legacy single-config
+if [ -f "$LEGACY_FILE" ]; then
+    CONFIG_FILES+=("$LEGACY_FILE")
+fi
+
+if [ ${#CONFIG_FILES[@]} -eq 0 ]; then
+    echo -e "${YELLOW}Warning: No auto-update configs found.${NC}"
+    echo "Run $BINARY_PATH, update a DNS record, and enable auto-update for each host you want."
+    read -p "Continue to set up a generic --all cron entry anyway? (y/N): " -n 1 -r
     echo
     if [[ ! $REPLY =~ ^[Yy]$ ]]; then
         echo "Setup cancelled."
@@ -59,35 +69,40 @@ echo "================================"
 crontab -l 2>/dev/null || echo "(No cron jobs currently set up)"
 
 echo ""
-echo -e "${YELLOW}Setting up cron job...${NC}"
+echo -e "${YELLOW}Setting up cron job(s)...${NC}"
 
-# Create the cron job entry
-CRON_ENTRY="* * * * * $BINARY_PATH --check-and-update >/dev/null 2>&1"
-
-# Check if entry already exists
-if crontab -l 2>/dev/null | grep -q "domeneshop-ip --check-and-update"; then
-    echo -e "${YELLOW}Cron job for domeneshop-ip already exists!${NC}"
-    echo ""
-    crontab -l | grep "domeneshop-ip"
-    echo ""
-    read -p "Do you want to replace it? (y/N): " -n 1 -r
+# Decide mode: per-config entries (default) or single --all entry
+MODE="per-config"
+if [ ${#CONFIG_FILES[@]} -gt 1 ]; then
+    read -p "Create separate entries per config (recommended) or one --all entry? [P/a]: " -n 1 -r choice
     echo
-    if [[ ! $REPLY =~ ^[Yy]$ ]]; then
-        echo "Setup cancelled."
-        exit 0
+    if [[ $choice =~ ^[Aa]$ ]]; then
+        MODE="all"
     fi
-
-    # Remove existing entries
-    crontab -l 2>/dev/null | grep -v "domeneshop-ip --check-and-update" | crontab -
 fi
 
-# Add new cron job
-(crontab -l 2>/dev/null; echo "$CRON_ENTRY") | crontab -
+if [ "$MODE" = "all" ]; then
+    CRON_ENTRY="* * * * * $BINARY_PATH --check-and-update --all >/dev/null 2>&1"
+    if crontab -l 2>/dev/null | grep -q "domeneshop-ip --check-and-update --all"; then
+        echo -e "${YELLOW}An --all cron job already exists; skipping add.${NC}"
+    else
+        (crontab -l 2>/dev/null; echo "$CRON_ENTRY") | crontab -
+        echo -e "${GREEN}✓ Added --all cron job${NC}"
+        echo "$CRON_ENTRY"
+    fi
+else
+    # Add/ensure an entry for each config
+    for cfg in "${CONFIG_FILES[@]}"; do
+        CRON_ENTRY="* * * * * $BINARY_PATH --check-and-update --config '$cfg' >/dev/null 2>&1"
+        if crontab -l 2>/dev/null | grep -Fq "--check-and-update --config '$cfg'"; then
+            echo -e "${YELLOW}Entry for $cfg already exists; skipping.${NC}"
+        else
+            (crontab -l 2>/dev/null; echo "$CRON_ENTRY") | crontab -
+            echo -e "${GREEN}✓ Added cron for $cfg${NC}"
+        fi
+    done
+fi
 
-echo -e "${GREEN}✓ Cron job added successfully!${NC}"
-echo ""
-echo "The following cron job has been set up:"
-echo "$CRON_ENTRY"
 echo ""
 echo "This will check for IP changes every minute and update DNS records only when needed."
 
@@ -98,20 +113,31 @@ echo
 if [[ $REPLY =~ ^[Yy]$ ]]; then
     LOG_DIR="$HOME/.local/share/domeneshop"
     mkdir -p "$LOG_DIR"
-    LOG_FILE="$LOG_DIR/auto_update.log"
-
-    # Remove the silent cron job and add one with logging
-    crontab -l | grep -v "domeneshop-ip --check-and-update" | crontab -
-
-    CRON_ENTRY_WITH_LOG="* * * * * $BINARY_PATH --check-and-update >> $LOG_FILE 2>&1"
-    (crontab -l 2>/dev/null; echo "$CRON_ENTRY_WITH_LOG") | crontab -
-
-    echo -e "${GREEN}✓ Logging enabled!${NC}"
-    echo "Logs will be written to: $LOG_FILE"
+    if [ "$MODE" = "all" ]; then
+        LOG_FILE="$LOG_DIR/auto_update_all.log"
+        # Remove existing --all silent entry and add logging variant
+        crontab -l | grep -v "domeneshop-ip --check-and-update --all" | crontab -
+        CRON_ENTRY_WITH_LOG="* * * * * $BINARY_PATH --check-and-update --all >> $LOG_FILE 2>&1"
+        (crontab -l 2>/dev/null; echo "$CRON_ENTRY_WITH_LOG") | crontab -
+        echo -e "${GREEN}✓ Logging enabled for --all!${NC}"
+        echo "Logs: $LOG_FILE"
+    else
+        # Per-config logging files
+        for cfg in "${CONFIG_FILES[@]}"; do
+            base=$(basename "$cfg")
+            LOG_FILE="$LOG_DIR/auto_update_${base%.json}.log"
+            # Remove existing silent entry for this config and add logging variant
+            crontab -l | grep -v "--check-and-update --config '$cfg'" | crontab -
+            CRON_ENTRY_WITH_LOG="* * * * * $BINARY_PATH --check-and-update --config '$cfg' >> $LOG_FILE 2>&1"
+            (crontab -l 2>/dev/null; echo "$CRON_ENTRY_WITH_LOG") | crontab -
+            echo -e "${GREEN}✓ Logging enabled for $cfg${NC}"
+            echo "Logs: $LOG_FILE"
+        done
+    fi
     echo "All log entries include timestamps for easy monitoring."
     echo ""
-    echo "To view recent logs:"
-    echo "tail -f $LOG_FILE"
+    echo "To view recent logs (example):"
+    echo "tail -f $HOME/.local/share/domeneshop/auto_update_all.log"
 fi
 
 echo ""

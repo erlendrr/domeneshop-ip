@@ -6,6 +6,7 @@ use pnet::datalink;
 use reqwest::StatusCode;
 use reqwest::blocking::Client;
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::fs;
 use std::io::Write;
 use std::path::PathBuf;
@@ -35,6 +36,18 @@ struct Cli {
         help = "Check and update DNS record if IP has changed (for cron jobs)"
     )]
     check_and_update: bool,
+
+    #[arg(
+        long,
+        help = "Path or name of the auto-update config to use. If a name is given, it will be looked up under the config dir."
+    )]
+    config: Option<String>,
+
+    #[arg(
+        long,
+        help = "Run check-and-update for all saved configs (one per domain/record)"
+    )]
+    all: bool,
 }
 
 #[derive(Deserialize, Debug)]
@@ -304,13 +317,16 @@ fn run_auto_update_check(config_path: &PathBuf) -> Result<(), Box<dyn std::error
     Ok(())
 }
 
-fn add_crontab_entry() -> Result<(), Box<dyn std::error::Error>> {
+fn add_crontab_entry_for_config(
+    config_path: &std::path::Path,
+) -> Result<(), Box<dyn std::error::Error>> {
     use std::process::Command;
 
     let binary_path = std::env::current_exe()?;
     let cron_entry = format!(
-        "* * * * * {} --check-and-update >/dev/null 2>&1",
-        binary_path.display()
+        "* * * * * {} --check-and-update --config '{}' >/dev/null 2>&1",
+        binary_path.display(),
+        config_path.display()
     );
 
     // Get current crontab
@@ -322,19 +338,17 @@ fn add_crontab_entry() -> Result<(), Box<dyn std::error::Error>> {
     if let Ok(output) = current_crontab {
         if output.status.success() {
             crontab_content = String::from_utf8_lossy(&output.stdout).to_string();
-
-            // Check if our entry already exists
-            if crontab_content.contains("domeneshop-ip --check-and-update") {
-                println!("Cron job for domeneshop-ip already exists. Updating...");
-                // Remove existing domeneshop-ip entries
-                crontab_content = crontab_content
-                    .lines()
-                    .filter(|line| !line.contains("domeneshop-ip --check-and-update"))
-                    .collect::<Vec<_>>()
-                    .join("\n");
-                if !crontab_content.is_empty() {
-                    crontab_content.push('\n');
-                }
+            // If the exact entry exists, do nothing; otherwise, ensure we don't duplicate similar entries for the same config
+            let exists_for_config = crontab_content.lines().any(|line| {
+                line.contains("domeneshop-ip --check-and-update")
+                    && line.contains(&config_path.display().to_string())
+            });
+            if exists_for_config {
+                println!("Cron job for this config already exists. Skipping add.");
+                return Ok(());
+            }
+            if !crontab_content.is_empty() && !crontab_content.ends_with('\n') {
+                crontab_content.push('\n');
             }
         }
     }
@@ -361,7 +375,7 @@ fn add_crontab_entry() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     println!("{}", "✓ Cron job added successfully!".green().bold());
-    println!("The system will now check for IP changes every minute.");
+    println!("The system will now check for IP changes every minute for this config.");
 
     Ok(())
 }
@@ -386,7 +400,15 @@ fn setup_auto_update_config(
         ttl,
     };
 
-    let config_path = config_dir.join("auto_update_config.json");
+    // Store one config per record under auto_update/ directory
+    let auto_update_dir = config_dir.join("auto_update");
+    fs::create_dir_all(&auto_update_dir)?;
+
+    // Build a readable, unique filename: <fqdn>__<type>.json
+    let fqdn = domain_input.to_string();
+    let sanitized = fqdn.replace('/', "_");
+    let file_name = format!("{}__{}.json", sanitized, record_type);
+    let config_path = auto_update_dir.join(file_name);
     let config_json = serde_json::to_string_pretty(&auto_update_config)?;
     fs::write(&config_path, config_json)?;
 
@@ -403,8 +425,11 @@ fn setup_auto_update_config(
     );
 
     // Automatically add crontab entry
-    println!("\n{}", "Setting up automatic IP monitoring...".yellow());
-    match add_crontab_entry() {
+    println!(
+        "\n{}",
+        "Setting up automatic IP monitoring for this domain/record...".yellow()
+    );
+    match add_crontab_entry_for_config(&config_path) {
         Ok(()) => {
             println!("{}", "Auto-update setup complete!".green().bold());
             println!("\nTo manage your cron job later:");
@@ -414,8 +439,9 @@ fn setup_auto_update_config(
             println!(
                 "• Test auto-update:  {}",
                 format!(
-                    "{} --check-and-update",
-                    std::env::current_exe().unwrap().display()
+                    "{} --check-and-update --config '{}'",
+                    std::env::current_exe().unwrap().display(),
+                    config_path.display()
                 )
                 .yellow()
             );
@@ -427,8 +453,9 @@ fn setup_auto_update_config(
             println!(
                 "{}",
                 format!(
-                    "echo '* * * * * {} --check-and-update' | crontab -",
-                    std::env::current_exe()?.display()
+                    "echo '* * * * * {} --check-and-update --config \"{}\"' | crontab -",
+                    std::env::current_exe()?.display(),
+                    config_path.display()
                 )
                 .yellow()
             );
@@ -451,21 +478,102 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Handle check-and-update mode (for cron jobs)
     if cli.check_and_update {
-        let auto_update_config_path = config_dir.join("auto_update_config.json");
-        if !auto_update_config_path.exists() {
-            eprintln!(
-                "Auto-update configuration not found. Please run the tool in interactive mode first to set up auto-update."
-            );
-            return Ok(());
-        }
+        // New multi-config location
+        let auto_update_dir = config_dir.join("auto_update");
 
-        return match run_auto_update_check(&auto_update_config_path) {
-            Ok(()) => Ok(()),
-            Err(e) => {
-                eprintln!("Auto-update check failed: {}", e);
-                std::process::exit(1);
+        // Helper to run one config
+        let run_one = |path: PathBuf| -> Result<(), Box<dyn std::error::Error>> {
+            match run_auto_update_check(&path) {
+                Ok(()) => Ok(()),
+                Err(e) => {
+                    Err(format!("Auto-update check failed for {}: {}", path.display(), e).into())
+                }
             }
         };
+
+        if cli.all {
+            // Iterate all configs under auto_update/*.json
+            if auto_update_dir.exists() {
+                let mut any = false;
+                for entry in fs::read_dir(&auto_update_dir)? {
+                    let entry = entry?;
+                    let path = entry.path();
+                    if path.extension().and_then(|s| s.to_str()) == Some("json") {
+                        any = true;
+                        if let Err(e) = run_one(path.clone()) {
+                            eprintln!("{}", e);
+                        }
+                    }
+                }
+                if !any {
+                    eprintln!(
+                        "No auto-update configs found in {}",
+                        auto_update_dir.display()
+                    );
+                }
+                return Ok(());
+            } else {
+                eprintln!(
+                    "No auto-update directory found at {}",
+                    auto_update_dir.display()
+                );
+                return Ok(());
+            }
+        }
+
+        if let Some(cfg) = cli.config {
+            // Accept absolute/relative path, or name under auto_update, optionally without .json
+            let mut path = PathBuf::from(&cfg);
+            if !path.exists() {
+                let mut candidate = auto_update_dir.join(&cfg);
+                if !candidate.exists() {
+                    // Try adding .json
+                    candidate.set_extension("json");
+                }
+                path = candidate;
+            }
+            if !path.exists() {
+                eprintln!(
+                    "Config not found: {}\nLooked under {}",
+                    cfg,
+                    auto_update_dir.display()
+                );
+                std::process::exit(1);
+            }
+            return run_one(path).map(|_| ());
+        }
+
+        // Legacy single-config support or auto-pick when only one exists
+        let legacy_path = config_dir.join("auto_update_config.json");
+        if legacy_path.exists() {
+            return run_one(legacy_path).map(|_| ());
+        }
+
+        // If exactly one config exists under auto_update, use it
+        if auto_update_dir.exists() {
+            let jsons: Vec<_> = fs::read_dir(&auto_update_dir)?
+                .filter_map(|e| e.ok())
+                .map(|e| e.path())
+                .filter(|p| p.extension().and_then(|s| s.to_str()) == Some("json"))
+                .collect();
+            if jsons.len() == 1 {
+                return run_one(jsons[0].clone()).map(|_| ());
+            }
+
+            eprintln!(
+                "Multiple configs found. Use --config <name|path> or --all. Available configs:"
+            );
+            for p in jsons {
+                if let Some(name) = p.file_name().and_then(|s| s.to_str()) {
+                    eprintln!("  - {}", name);
+                }
+            }
+        } else {
+            eprintln!(
+                "Auto-update configuration not found. Run interactive setup to create configs."
+            );
+        }
+        return Ok(());
     }
 
     let theme = ColorfulTheme::default();
@@ -542,88 +650,79 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     let domain_names: Vec<String> = domains.iter().map(|d| d.domain.clone()).collect();
-    // Display all available domains to the user
     println!("\nAvailable domains:");
     for domain in &domain_names {
         println!("  - {}", domain);
     }
 
-    // Ask the user to input a domain or subdomain
-    let mut top_level_domain_id = None;
-
-    let domain_input = match &cli.domain_input {
-        Some(input) => match validate_domain_input(input, &domains) {
-            Ok((input_str, domain_id)) => {
-                top_level_domain_id = Some(domain_id);
-                input_str
-            }
-            Err(err) => {
-                println!("{}", err);
-                return Ok(());
-            }
-        },
+    // Gather one or more domain inputs
+    let raw_inputs = match &cli.domain_input {
+        Some(input) => input.clone(),
         None => Input::with_theme(&theme)
-            .with_prompt("Enter a domain or subdomain (e.g. example.com or sub.example.com)")
-            .validate_with(|input: &String| -> Result<(), &str> {
-                match validate_domain_input(input, &domains) {
-                    Ok((_, domain_id)) => {
-                        top_level_domain_id = Some(domain_id);
-                        Ok(())
+            .with_prompt("Enter one or more domains/subdomains (comma or space separated)")
+            .validate_with(|raw: &String| -> Result<(), &str> {
+                let items: Vec<_> = raw
+                    .split(|c: char| c == ',' || c.is_whitespace())
+                    .filter(|s| !s.is_empty())
+                    .collect();
+                if items.is_empty() { return Err("Please enter at least one domain."); }
+                for s in &items {
+                    if validate_domain_input(s, &domains).is_err() {
+                        return Err("You don't own one of these domains. Ensure each is owned by your account.");
                     }
-                    Err(err) => Err(err),
                 }
+                Ok(())
             })
             .interact_text()?,
     };
 
-    let top_level_domain = domains
-        .iter()
-        .find(|d| d.id == top_level_domain_id.expect("Domain ID not found"))
-        .expect("Domain not found");
+    let input_domains: Vec<String> = raw_inputs
+        .split(|c: char| c == ',' || c.is_whitespace())
+        .filter(|s| !s.is_empty())
+        .map(|s| s.trim().to_string())
+        .collect();
 
-    println!("Getting DNS records for {}...", top_level_domain.domain);
-
-    // Fetch DNS records for the selected domain.
-    let dns_url = format!(
-        "https://api.domeneshop.no/v0/domains/{}/dns",
-        top_level_domain.id
-    );
-
-    let dns_response = client
-        .get(&dns_url)
-        .basic_auth(&token, Some(&secret))
-        .send()?;
-
-    if !dns_response.status().is_success() {
-        eprintln!(
-            "Error fetching DNS records. Status: {}",
-            dns_response.status()
-        );
-        return Ok(());
-    }
-
-    let dns_records: Vec<DnsRecord> = dns_response.json()?;
-    if dns_records.is_empty() {
-        println!("No DNS records found for the domain.");
-    } else {
-        println!("\nDNS Records for {}:", top_level_domain.domain);
-        for rec in &dns_records {
-            // If host is "@", it represents the root domain.
-            let full_host = if rec.host == "@" {
-                top_level_domain.domain.clone()
-            } else {
-                format!("{}.{}", rec.host, top_level_domain.domain)
-            };
-            println!(
-                "ID: {} | Host: {} | Type: {} | Data: {} | TTL: {}",
-                rec.id, full_host, rec.record_type, rec.data, rec.ttl
-            );
+    // Map each input to its top-level domain id
+    let mut selections: Vec<(String, u64)> = Vec::new();
+    for s in &input_domains {
+        match validate_domain_input(s, &domains) {
+            Ok((inp, id)) => selections.push((inp, id)),
+            Err(err) => {
+                println!("{} -> {}", s, err);
+                return Ok(());
+            }
         }
     }
 
-    // Parse the domain input to get the host part
-    let (host, domain_part) = parse_domain_input(&domain_input, &top_level_domain.domain);
-    println!("Host: {}, Domain: {}", host, domain_part);
+    // Build domain_id -> Domain lookup
+    let mut domain_by_id: HashMap<u64, &Domain> = HashMap::new();
+    for d in &domains {
+        domain_by_id.insert(d.id, d);
+    }
+
+    // Fetch DNS records once per domain_id
+    let mut dns_map: HashMap<u64, Vec<DnsRecord>> = HashMap::new();
+    for (_, did) in selections
+        .iter()
+        .cloned()
+        .collect::<std::collections::BTreeSet<_>>()
+    {
+        let dns_url = format!("https://api.domeneshop.no/v0/domains/{}/dns", did);
+        let dns_response = client
+            .get(&dns_url)
+            .basic_auth(&token, Some(&secret))
+            .send()?;
+        if !dns_response.status().is_success() {
+            eprintln!(
+                "Error fetching DNS records for domain id {}. Status: {}",
+                did,
+                dns_response.status()
+            );
+            return Ok(());
+        }
+        let recs: Vec<DnsRecord> = dns_response.json()?;
+        dns_map.insert(did, recs);
+    }
 
     // Get the public IP address from ifconfig.me
     println!("Fetching public IP address from ifconfig.me...");
@@ -665,237 +764,223 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
 
-    // Prompt user for IP selection with public IP as default
+    // Prompt user for IP selection with public IP as default (applies to all)
     let selected_ip = if cli.yes {
         public_ip.clone()
     } else {
         Input::<String>::with_theme(&theme)
-            .with_prompt("Enter the IP address to use")
+            .with_prompt("Enter the IP address to use for all selected hosts")
             .default(public_ip.clone())
             .interact_text()?
     };
 
     println!("Selected IP address: {}", selected_ip);
 
-    // After getting selected IP, check for existing DNS records
-    let existing_record = dns_records
-        .iter()
-        .find(|r| r.host == host && (r.record_type == "A" || r.record_type == "AAAA"));
-
-    // Determine if we're updating an IPv4 or IPv6 address
+    // Determine record type once for chosen IP
     let record_type = if selected_ip.contains(':') {
         "AAAA"
     } else {
         "A"
     };
 
-    let mut dns_updated = false;
-    let mut final_ttl = 3600u32; // Default TTL
-    let mut auto_update_enabled = false;
+    // Track configs for optional auto-update
+    struct PlannedConfig {
+        domain_input: String,
+        host: String,
+        domain_id: u64,
+        ttl: u32,
+    }
+    let mut planned: Vec<PlannedConfig> = Vec::new();
 
-    if let Some(record) = existing_record {
-        println!("\n{}", "Existing DNS record found:".yellow().bold());
-        println!(
-            "ID: {} | Host: {} | Type: {} | IP: {} | TTL: {}",
-            record.id,
-            if record.host == "@" {
-                top_level_domain.domain.clone()
-            } else {
-                format!("{}.{}", record.host, top_level_domain.domain)
-            },
-            record.record_type,
-            record.data,
-            record.ttl
-        );
-
-        final_ttl = record.ttl; // Use existing TTL
-
-        let should_update = if cli.yes {
-            true
-        } else {
-            Confirm::with_theme(&theme)
-                .with_prompt(format!(
-                    "Do you want to update this record to point to {}?",
-                    selected_ip
-                ))
-                .default(true)
-                .interact()?
+    // Process each input domain
+    for (domain_input, dom_id) in &selections {
+        let top = match domain_by_id.get(dom_id) {
+            Some(d) => d,
+            None => {
+                eprintln!("Domain not found for id {}", dom_id);
+                continue;
+            }
         };
+        let (host, _domain_part) = parse_domain_input(domain_input, &top.domain);
 
-        if should_update {
-            // Check if record type needs to change (A vs AAAA)
-            let type_change_needed = record.record_type != record_type;
+        // Find existing record in cache
+        let empty: Vec<DnsRecord> = Vec::new();
+        let dns_records_ref = dns_map.get(dom_id);
+        let dns_records: &Vec<DnsRecord> = match dns_records_ref {
+            Some(v) => v,
+            None => &empty,
+        };
+        let existing_record = dns_records
+            .iter()
+            .find(|r| r.host == host && (r.record_type == "A" || r.record_type == "AAAA"));
 
-            if type_change_needed {
-                // Need to delete existing record and create a new one
-                println!(
-                    "Record type needs to change from {} to {}. Deleting old record...",
-                    record.record_type, record_type
-                );
-
-                // Delete the existing record
-                let delete_url = format!(
-                    "https://api.domeneshop.no/v0/domains/{}/dns/{}",
-                    top_level_domain.id, record.id
-                );
-
-                let delete_response = client
-                    .delete(&delete_url)
-                    .basic_auth(&token, Some(&secret))
-                    .send()?;
-
-                if !delete_response.status().is_success() {
-                    eprintln!(
-                        "Failed to delete old DNS record. Status: {}",
-                        delete_response.status()
-                    );
-                    if let Ok(error_text) = delete_response.text() {
-                        eprintln!("Error: {}", error_text);
-                    }
-                    return Ok(());
-                }
-
-                println!("Creating new record with updated type...");
-
-                // Create new record
-                let new_record = DnsRecordUpdate {
-                    host: host.clone(),
-                    ttl: record.ttl,
-                    record_type: record_type.to_string(),
-                    data: selected_ip.clone(),
-                };
-
-                let create_url = format!(
-                    "https://api.domeneshop.no/v0/domains/{}/dns",
-                    top_level_domain.id
-                );
-
-                let create_response = client
-                    .post(&create_url)
-                    .basic_auth(&token, Some(&secret))
-                    .json(&new_record)
-                    .send()?;
-
-                if create_response.status() == StatusCode::CREATED {
-                    println!("{}", "DNS record created successfully!".green().bold());
-                    dns_updated = true;
+        let mut ttl_use = 3600u32;
+        if let Some(record) = existing_record {
+            println!("\n{}", "Existing DNS record found:".yellow().bold());
+            println!(
+                "ID: {} | Host: {} | Type: {} | IP: {} | TTL: {}",
+                record.id,
+                if record.host == "@" {
+                    top.domain.clone()
                 } else {
-                    eprintln!(
-                        "Failed to create new DNS record. Status: {}",
-                        create_response.status()
+                    format!("{}.{}", record.host, top.domain)
+                },
+                record.record_type,
+                record.data,
+                record.ttl
+            );
+            ttl_use = record.ttl;
+
+            let should_update = if cli.yes {
+                true
+            } else {
+                Confirm::with_theme(&theme)
+                    .with_prompt(format!("Update {} to {}?", domain_input, selected_ip))
+                    .default(true)
+                    .interact()?
+            };
+
+            if should_update {
+                let type_change_needed = record.record_type != record_type;
+
+                if type_change_needed {
+                    println!(
+                        "Changing record type from {} to {} for {}...",
+                        record.record_type, record_type, domain_input
                     );
-                    if let Ok(error_text) = create_response.text() {
-                        eprintln!("Error: {}", error_text);
+                    let delete_url = format!(
+                        "https://api.domeneshop.no/v0/domains/{}/dns/{}",
+                        top.id, record.id
+                    );
+                    let delete_response = client
+                        .delete(&delete_url)
+                        .basic_auth(&token, Some(&secret))
+                        .send()?;
+                    if !delete_response.status().is_success() {
+                        eprintln!(
+                            "Failed to delete old DNS record. Status: {}",
+                            delete_response.status()
+                        );
+                        if let Ok(error_text) = delete_response.text() {
+                            eprintln!("Error: {}", error_text);
+                        }
+                        continue;
+                    }
+                    let new_record = DnsRecordUpdate {
+                        host: host.clone(),
+                        ttl: record.ttl,
+                        record_type: record_type.to_string(),
+                        data: selected_ip.clone(),
+                    };
+                    let create_url = format!("https://api.domeneshop.no/v0/domains/{}/dns", top.id);
+                    let create_response = client
+                        .post(&create_url)
+                        .basic_auth(&token, Some(&secret))
+                        .json(&new_record)
+                        .send()?;
+                    if create_response.status() == StatusCode::CREATED {
+                        println!("{}", "DNS record created successfully!".green().bold());
+                    } else {
+                        eprintln!(
+                            "Failed to create new DNS record. Status: {}",
+                            create_response.status()
+                        );
+                        if let Ok(error_text) = create_response.text() {
+                            eprintln!("Error: {}", error_text);
+                        }
+                    }
+                } else {
+                    let update = DnsRecordUpdate {
+                        host: host.clone(),
+                        ttl: record.ttl,
+                        record_type: record.record_type.clone(),
+                        data: selected_ip.clone(),
+                    };
+                    let update_url = format!(
+                        "https://api.domeneshop.no/v0/domains/{}/dns/{}",
+                        top.id, record.id
+                    );
+                    let response = client
+                        .put(&update_url)
+                        .basic_auth(&token, Some(&secret))
+                        .json(&update)
+                        .send()?;
+                    if response.status().is_success() {
+                        println!("{}", "DNS record updated successfully!".green().bold());
+                    } else {
+                        eprintln!("Failed to update DNS record. Status: {}", response.status());
+                        if let Ok(error_text) = response.text() {
+                            eprintln!("Error: {}", error_text);
+                        }
                     }
                 }
             } else {
-                // Same record type, can update normally
-                // Create update payload
-                let update = DnsRecordUpdate {
-                    host: host.clone(),
-                    ttl: record.ttl,
-                    record_type: record.record_type.clone(), // Use existing record type
-                    data: selected_ip.clone(),
-                };
-
-                // Send update request
-                println!("Updating DNS record...");
-                let update_url = format!(
-                    "https://api.domeneshop.no/v0/domains/{}/dns/{}",
-                    top_level_domain.id, record.id
-                );
-
-                let response = client
-                    .put(&update_url)
-                    .basic_auth(&token, Some(&secret))
-                    .json(&update)
-                    .send()?;
-
-                if response.status().is_success() {
-                    println!("{}", "DNS record updated successfully!".green().bold());
-                    dns_updated = true;
-                } else {
-                    eprintln!("Failed to update DNS record. Status: {}", response.status());
-                    if let Ok(error_text) = response.text() {
-                        eprintln!("Error: {}", error_text);
-                    }
-                }
+                println!("Update cancelled for {}.", domain_input);
             }
         } else {
-            println!("Update cancelled.");
-        }
-    } else {
-        // No existing record, create a new one
-        println!(
-            "\n{}",
-            "No existing DNS record found. Creating new record...".yellow()
-        );
-
-        // Create new record payload
-        let new_record = DnsRecordUpdate {
-            host: host.clone(),
-            ttl: 3600, // Default TTL
-            record_type: record_type.to_string(),
-            data: selected_ip.clone(),
-        };
-
-        // Send create request
-        let create_url = format!(
-            "https://api.domeneshop.no/v0/domains/{}/dns",
-            top_level_domain.id
-        );
-
-        let response = client
-            .post(&create_url)
-            .basic_auth(&token, Some(&secret))
-            .json(&new_record)
-            .send()?;
-
-        if response.status() == StatusCode::CREATED {
-            println!("{}", "DNS record created successfully!".green().bold());
-            dns_updated = true;
-        } else {
-            eprintln!("Failed to create DNS record. Status: {}", response.status());
-            if let Ok(error_text) = response.text() {
-                eprintln!("Error: {}", error_text);
+            println!(
+                "\n{} {}",
+                "No existing DNS record found. Creating new record for".yellow(),
+                domain_input
+            );
+            let new_record = DnsRecordUpdate {
+                host: host.clone(),
+                ttl: 3600,
+                record_type: record_type.to_string(),
+                data: selected_ip.clone(),
+            };
+            let create_url = format!("https://api.domeneshop.no/v0/domains/{}/dns", top.id);
+            let response = client
+                .post(&create_url)
+                .basic_auth(&token, Some(&secret))
+                .json(&new_record)
+                .send()?;
+            if response.status() == StatusCode::CREATED {
+                println!("{}", "DNS record created successfully!".green().bold());
+            } else {
+                eprintln!("Failed to create DNS record. Status: {}", response.status());
+                if let Ok(error_text) = response.text() {
+                    eprintln!("Error: {}", error_text);
+                }
             }
         }
+
+        planned.push(PlannedConfig {
+            domain_input: domain_input.clone(),
+            host,
+            domain_id: *dom_id,
+            ttl: ttl_use,
+        });
     }
 
-    // Ask about auto-update if DNS was successfully updated
-    if dns_updated {
+    // Offer auto-update for all selected hosts
+    if !planned.is_empty() {
         let setup_auto_update = if cli.yes {
             false
         } else {
             Confirm::with_theme(&theme)
-                .with_prompt(
-                    "Do you want to enable automatic DNS record updates when your IP changes?",
-                )
+                .with_prompt("Enable automatic DNS updates for all selected hosts?")
                 .default(false)
                 .interact()?
         };
-
         if setup_auto_update {
-            setup_auto_update_config(
-                &token,
-                &secret,
-                &domain_input,
-                &host,
-                top_level_domain.id,
-                record_type,
-                final_ttl,
-                &config_dir,
-            )?;
-            auto_update_enabled = true;
+            for p in planned {
+                let _ = setup_auto_update_config(
+                    &token,
+                    &secret,
+                    &p.domain_input,
+                    &p.host,
+                    p.domain_id,
+                    record_type,
+                    p.ttl,
+                    &config_dir,
+                );
+            }
         }
     }
-
-    // Save credentials automatically if auto-update is enabled, otherwise ask
+    // Save credentials choice
     if !use_saved_config {
-        let save_creds = if auto_update_enabled {
-            println!("Auto-update enabled - automatically saving credentials for future use.");
-            true
-        } else if cli.yes {
+        let save_creds = if cli.yes {
             false
         } else {
             Confirm::with_theme(&theme)
@@ -907,7 +992,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             let mut file = fs::File::create(&config_path)?;
             writeln!(file, "DOMENESHOP_API_TOKEN={}", token)?;
             writeln!(file, "DOMENESHOP_API_SECRET={}", secret)?;
-            // On Unix, restrict permissions to owner-read/write only.
             #[cfg(unix)]
             {
                 use std::os::unix::fs::PermissionsExt;

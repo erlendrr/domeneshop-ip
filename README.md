@@ -22,29 +22,33 @@ domeneshop-ip [OPTIONS]
 --domain-input <DOMAIN>    Domain to manage (e.g. example.com or sub.example.com)
 -y, --yes                  Skip all confirmation prompts
 --check-and-update         Check and update DNS record if IP has changed (for cron jobs)
+--config <PATH|NAME>       Path or name of an auto-update config to use with --check-and-update
+--all                      Run --check-and-update for all saved configs
 --help                     Show help information
 --version                  Show version information
 ```
 
 ## Features
 
-- Automatically detects your public IP address
-- Lists available network interfaces
-- Updates DNS A or AAAA records at Domeneshop
-- Stores API credentials securely for future use
-- Interactive mode with confirmation prompts
-- **Auto-update mode**: Automatically update DNS records when your IP changes
-- **Cron job support**: Run periodic checks without user interaction
+-   Automatically detects your public IP address
+-   Lists available network interfaces
+-   Updates DNS A or AAAA records at Domeneshop
+-   Stores API credentials securely for future use
+-   Interactive mode with confirmation prompts
+-   **Auto-update mode**: Automatically update DNS records when your IP changes
+-   **Cron job support**: Run periodic checks without user interaction
+-   **Multi-domain/host**: Save multiple auto-update profiles and update each separately or all at once
 
 ## Auto-Update Setup
 
 After successfully updating a DNS record, the tool will offer to set up automatic updates. If enabled:
 
-1. Configuration is saved securely to `~/.config/domeneshop/auto_update_config.json`
-2. The tool provides a cron job command to run every minute
-3. Use `--check-and-update` flag to check for IP changes and update only when needed
+1. A configuration is saved securely per host under `~/.config/domeneshop/auto_update/`
+    - Example: `~/.config/domeneshop/auto_update/app.example.com__A.json`
+2. The tool can add a cron job entry per config automatically
+3. Use `--check-and-update` with `--config <file>` to check/update one host, or `--all` to handle all configs
 
-### Example Cron Job
+### Example Cron Jobs
 
 To check for IP changes every minute:
 
@@ -52,15 +56,29 @@ To check for IP changes every minute:
 # Edit your cron jobs
 crontab -e
 
-# Add this line (replace path with your actual binary path):
-* * * * * /path/to/domeneshop-ip --check-and-update
+# Update one specific host (recommended: one entry per host)
+* * * * * /path/to/domeneshop-ip --check-and-update --config '/Users/you/.config/domeneshop/auto_update/app.example.com__A.json'
+
+# Or update all saved hosts in one go
+* * * * * /path/to/domeneshop-ip --check-and-update --all
 ```
 
 The auto-update process:
-- Fetches your current public IP address
-- Compares it with the current DNS record
-- Updates the DNS record **only** if the IP has changed
-- Logs results for monitoring
+
+-   Fetches your current public IP address
+-   Compares it with the current DNS record
+-   Updates the DNS record **only** if the IP has changed
+-   Logs results for monitoring
+
+## Typical multi-host setup
+
+Repeat the interactive flow for each host you want to manage, e.g.:
+
+-   app.bedrockchain.com
+-   api.bedrockchain.com
+-   www.bedrockchain.com
+
+Enable auto-update when prompted each time. This creates separate config files under `~/.config/domeneshop/auto_update/` and the tool can create matching cron entries per host. You can also switch to a single `--all` cron entry if preferred.
 
 ## License
 
